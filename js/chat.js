@@ -1,24 +1,34 @@
-// Vibe Pare — Chat logic (v2 - fixed realtime)
+// Vibe Pare — Chat logic (v3 - debug)
 
-// ---------- Get user + room ----------
+console.log('=== CHAT.JS LOADED ===');
+
 let user = null;
 try {
   user = JSON.parse(localStorage.getItem('vibepare_user') || 'null');
 } catch (e) { user = null; }
 
 const roomId = localStorage.getItem('vibepare_room');
+console.log('User:', user);
+console.log('Room ID:', roomId);
 
 if (!user || !roomId) {
+  console.log('Missing user or room — redirecting');
   window.location.href = 'index.html';
 }
 
-// ---------- DOM ----------
 const messagesEl = document.getElementById('messages');
 const msgInput = document.getElementById('msgInput');
 const sendBtn = document.getElementById('sendBtn');
 const typingIndicator = document.getElementById('typingIndicator');
 const partnerNameEl = document.getElementById('partnerName');
 const partnerMetaEl = document.getElementById('partnerMeta');
+
+console.log('Elements found:', {
+  messages: !!messagesEl,
+  input: !!msgInput,
+  sendBtn: !!sendBtn,
+  typing: !!typingIndicator
+});
 
 let partnerSession = null;
 let lastMessageTime = 0;
@@ -29,7 +39,7 @@ let renderedMessageIds = new Set();
 
 // ---------- Load room ----------
 async function loadRoom() {
-  console.log('[chat] loading room', roomId);
+  console.log('[1] Loading room...');
 
   const { data: room, error } = await supabaseClient
     .from('rooms')
@@ -38,12 +48,11 @@ async function loadRoom() {
     .single();
 
   if (error || !room) {
-    console.error('[chat] room load failed', error);
-    window.location.href = 'index.html';
+    console.error('[1] Failed:', error);
     return;
   }
 
-  console.log('[chat] room loaded', room);
+  console.log('[1] Room loaded:', room);
 
   const isUserA = room.user_a_session === user.sessionId;
   partnerSession = isUserA ? room.user_b_session : room.user_a_session;
@@ -53,17 +62,16 @@ async function loadRoom() {
   if (partnerNameEl) partnerNameEl.textContent = partnerName;
   if (partnerMetaEl) partnerMetaEl.textContent = `${partnerGender} • ${room.country}`;
 
-  // Load existing messages
   await loadMessages();
-
-  // Subscribe to new messages
   subscribeMessages();
-
-  // Presence for typing + disconnect
   setupPresence();
+
+  // Fallback: also poll every 3 seconds (in case realtime fails)
+  setInterval(loadMessages, 3000);
+  console.log('[1] Setup complete');
 }
 
-// ---------- Load past messages ----------
+// ---------- Load messages ----------
 async function loadMessages() {
   const { data, error } = await supabaseClient
     .from('messages')
@@ -71,44 +79,50 @@ async function loadMessages() {
     .eq('room_id', roomId)
     .order('created_at', { ascending: true });
 
-  if (error) { console.error('[chat] load messages failed', error); return; }
+  if (error) {
+    console.error('[2] Load messages error:', error);
+    return;
+  }
 
-  (data || []).forEach(addMessageToUI);
+  console.log('[2] Loaded', (data || []).length, 'messages from DB');
+
+  (data || []).forEach(msg => {
+    if (!renderedMessageIds.has(msg.id)) {
+      addMessageToUI(msg);
+    }
+  });
   scrollToBottom();
-  console.log('[chat] loaded', (data || []).length, 'messages');
 }
 
 // ---------- Realtime subscribe ----------
 function subscribeMessages() {
-  console.log('[chat] subscribing to realtime...');
+  console.log('[3] Subscribing to realtime channel: chat_' + roomId);
 
   roomChannel = supabaseClient
     .channel('chat_' + roomId)
     .on(
       'postgres_changes',
-      {
-        event: 'INSERT',
-        schema: 'public',
-        table: 'messages'
-      },
+      { event: 'INSERT', schema: 'public', table: 'messages' },
       (payload) => {
-        console.log('[chat] realtime INSERT received', payload);
-        // Filter in JS (server-side filter can fail)
-        if (payload.new.room_id !== roomId) return;
-        if (renderedMessageIds.has(payload.new.id)) return; // prevent dupes
+        console.log('[3] REALTIME EVENT:', payload);
+        if (payload.new.room_id !== roomId) {
+          console.log('[3] Ignoring — wrong room');
+          return;
+        }
+        if (renderedMessageIds.has(payload.new.id)) {
+          console.log('[3] Ignoring — already rendered');
+          return;
+        }
         addMessageToUI(payload.new);
         scrollToBottom();
       }
     )
     .subscribe((status, err) => {
-      console.log('[chat] realtime status:', status, err || '');
-      if (status === 'CHANNEL_ERROR' || status === 'TIMED_OUT') {
-        console.error('[chat] realtime connection failed');
-      }
+      console.log('[3] Channel status:', status, err || '');
     });
 }
 
-// ---------- Add message to UI ----------
+// ---------- Add message ----------
 function addMessageToUI(msg) {
   if (!messagesEl) return;
   if (renderedMessageIds.has(msg.id)) return;
@@ -134,31 +148,20 @@ async function sendMessage() {
   lastMessageTime = now;
 
   msgInput.value = '';
+  console.log('[4] Sending message:', text);
 
-  // Optimistic UI (show immediately)
-  const tempMsg = {
-    id: 'temp_' + Date.now(),
-    room_id: roomId,
-    sender_session: user.sessionId,
-    sender_name: user.name,
-    content: text,
-    created_at: new Date().toISOString()
-  };
-  addMessageToUI(tempMsg);
-  scrollToBottom();
-
-  const { error } = await supabaseClient.from('messages').insert({
+  const { data, error } = await supabaseClient.from('messages').insert({
     room_id: roomId,
     sender_session: user.sessionId,
     sender_name: user.name,
     content: text
-  });
+  }).select();
 
   if (error) {
-    console.error('[chat] send failed', error);
-    showSystemMessage('Failed to send: ' + error.message);
+    console.error('[4] Send FAILED:', error);
+    showSystemMessage('Send failed: ' + error.message);
   } else {
-    console.log('[chat] message sent');
+    console.log('[4] Send SUCCESS:', data);
   }
 
   msgInput.focus();
@@ -173,82 +176,41 @@ msgInput.addEventListener('keydown', (e) => {
   if (e.key === 'Enter') {
     e.preventDefault();
     sendMessage();
-  } else {
-    broadcastTyping();
   }
 });
 
 // ---------- Presence ----------
-let partnerWasHere = false;
-let disconnectTimer = null;
-
 function setupPresence() {
   presenceChannel = supabaseClient.channel('presence_' + roomId, {
     config: { presence: { key: user.sessionId } }
   });
 
   presenceChannel
-    .on('presence', { event: 'sync' }, () => {
-      const state = presenceChannel.presenceState();
-      const others = Object.keys(state).filter(k => k !== user.sessionId);
-      console.log('[chat] presence sync, others:', others.length);
-
-      if (others.length > 0) {
-        partnerWasHere = true;
-        if (disconnectTimer) { clearTimeout(disconnectTimer); disconnectTimer = null; }
-      } else if (partnerWasHere) {
-        if (!disconnectTimer) {
-          disconnectTimer = setTimeout(() => {
-            showSystemMessage('Stranger disconnected.');
-          }, 3000);
-        }
-      }
-    })
-    .on('presence', { event: 'leave' }, ({ key }) => {
-      if (key !== user.sessionId && partnerWasHere && !disconnectTimer) {
-        disconnectTimer = setTimeout(() => {
-          showSystemMessage('Stranger disconnected.');
-        }, 3000);
-      }
-    })
+    .on('presence', { event: 'sync' }, () => {})
     .on('broadcast', { event: 'typing' }, ({ payload }) => {
       if (payload.session !== user.sessionId) showTyping();
     })
     .subscribe(async (status) => {
-      console.log('[chat] presence status:', status);
+      console.log('[5] Presence status:', status);
       if (status === 'SUBSCRIBED') {
         await presenceChannel.track({ session: user.sessionId });
       }
     });
 }
 
-function broadcastTyping() {
-  if (!presenceChannel) return;
-  presenceChannel.send({
-    type: 'broadcast',
-    event: 'typing',
-    payload: { session: user.sessionId }
-  });
-}
-
 function showTyping() {
   if (!typingIndicator) return;
   typingIndicator.classList.remove('hidden');
   clearTimeout(typingTimeout);
-  typingTimeout = setTimeout(() => {
-    typingIndicator.classList.add('hidden');
-  }, 2000);
+  typingTimeout = setTimeout(() => typingIndicator.classList.add('hidden'), 2000);
 }
 
 // ---------- Buttons ----------
 document.getElementById('nextBtn').addEventListener('click', async () => {
   await endChat();
   await supabaseClient.from('waiting_queue').upsert({
-    session_id: user.sessionId,
-    name: user.name,
-    country: user.country,
-    gender: user.gender,
-    joined_at: new Date().toISOString()
+    session_id: user.sessionId, name: user.name, country: user.country,
+    gender: user.gender, joined_at: new Date().toISOString()
   }, { onConflict: 'session_id' });
   window.location.href = 'match.html';
 });
@@ -261,20 +223,12 @@ document.getElementById('stopBtn').addEventListener('click', async () => {
 });
 
 document.getElementById('blockBtn').addEventListener('click', async () => {
-  if (!confirm('Block this person and never match again?')) return;
+  if (!confirm('Block this person?')) return;
   await supabaseClient.from('blocks').insert({
-    blocker_session: user.sessionId,
-    blocked_session: partnerSession
+    blocker_session: user.sessionId, blocked_session: partnerSession
   });
   await endChat();
-  await supabaseClient.from('waiting_queue').upsert({
-    session_id: user.sessionId,
-    name: user.name,
-    country: user.country,
-    gender: user.gender,
-    joined_at: new Date().toISOString()
-  }, { onConflict: 'session_id' });
-  window.location.href = 'match.html';
+  window.location.href = 'index.html';
 });
 
 async function endChat() {
@@ -311,10 +265,3 @@ function showSystemMessage(text) {
 
 // ---------- Init ----------
 loadRoom();
-
-// Keep presence alive
-setInterval(() => {
-  if (presenceChannel) {
-    presenceChannel.track({ session: user.sessionId });
-  }
-}, 25000);
