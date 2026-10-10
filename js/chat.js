@@ -1,18 +1,18 @@
-// Vibe Pare — Chat logic
+// Vibe Pare — Chat logic (v2 - fixed realtime)
 
-const user = JSON.parse(localStorage.getItem('vibepare_user') || 'null');
+// ---------- Get user + room ----------
+let user = null;
+try {
+  user = JSON.parse(localStorage.getItem('vibepare_user') || 'null');
+} catch (e) { user = null; }
+
 const roomId = localStorage.getItem('vibepare_room');
-
-window.addEventListener('beforeunload', async () => {
-  if (presenceChannel) {
-    await presenceChannel.untrack();
-  }
-});
 
 if (!user || !roomId) {
   window.location.href = 'index.html';
 }
 
+// ---------- DOM ----------
 const messagesEl = document.getElementById('messages');
 const msgInput = document.getElementById('msgInput');
 const sendBtn = document.getElementById('sendBtn');
@@ -25,65 +25,95 @@ let lastMessageTime = 0;
 let roomChannel = null;
 let presenceChannel = null;
 let typingTimeout = null;
+let renderedMessageIds = new Set();
 
-// ---------- Load room info ----------
+// ---------- Load room ----------
 async function loadRoom() {
-  const { data: room } = await supabaseClient
+  console.log('[chat] loading room', roomId);
+
+  const { data: room, error } = await supabaseClient
     .from('rooms')
     .select('*')
     .eq('id', roomId)
     .single();
 
-  if (!room) {
+  if (error || !room) {
+    console.error('[chat] room load failed', error);
     window.location.href = 'index.html';
     return;
   }
+
+  console.log('[chat] room loaded', room);
 
   const isUserA = room.user_a_session === user.sessionId;
   partnerSession = isUserA ? room.user_b_session : room.user_a_session;
   const partnerName = isUserA ? room.user_b_name : room.user_a_name;
   const partnerGender = isUserA ? room.user_b_gender : room.user_a_gender;
 
-  partnerNameEl.textContent = partnerName;
-  partnerMetaEl.textContent = `${partnerGender} • ${room.country}`;
+  if (partnerNameEl) partnerNameEl.textContent = partnerName;
+  if (partnerMetaEl) partnerMetaEl.textContent = `${partnerGender} • ${room.country}`;
 
-  loadMessages();
+  // Load existing messages
+  await loadMessages();
+
+  // Subscribe to new messages
   subscribeMessages();
+
+  // Presence for typing + disconnect
   setupPresence();
 }
 
 // ---------- Load past messages ----------
 async function loadMessages() {
-  const { data } = await supabaseClient
+  const { data, error } = await supabaseClient
     .from('messages')
     .select('*')
     .eq('room_id', roomId)
     .order('created_at', { ascending: true });
 
+  if (error) { console.error('[chat] load messages failed', error); return; }
+
   (data || []).forEach(addMessageToUI);
   scrollToBottom();
+  console.log('[chat] loaded', (data || []).length, 'messages');
 }
 
-// ---------- Realtime: new messages ----------
+// ---------- Realtime subscribe ----------
 function subscribeMessages() {
+  console.log('[chat] subscribing to realtime...');
+
   roomChannel = supabaseClient
-    .channel('room:' + roomId)
-    .on('postgres_changes',
-      { event: 'INSERT', schema: 'public', table: 'messages' },
+    .channel('chat_' + roomId)
+    .on(
+      'postgres_changes',
+      {
+        event: 'INSERT',
+        schema: 'public',
+        table: 'messages'
+      },
       (payload) => {
-        // Filter in JS instead of server-side
+        console.log('[chat] realtime INSERT received', payload);
+        // Filter in JS (server-side filter can fail)
         if (payload.new.room_id !== roomId) return;
+        if (renderedMessageIds.has(payload.new.id)) return; // prevent dupes
         addMessageToUI(payload.new);
         scrollToBottom();
       }
     )
-    .subscribe((status) => {
-      console.log('Realtime status:', status);
+    .subscribe((status, err) => {
+      console.log('[chat] realtime status:', status, err || '');
+      if (status === 'CHANNEL_ERROR' || status === 'TIMED_OUT') {
+        console.error('[chat] realtime connection failed');
+      }
     });
 }
 
 // ---------- Add message to UI ----------
 function addMessageToUI(msg) {
+  if (!messagesEl) return;
+  if (renderedMessageIds.has(msg.id)) return;
+  renderedMessageIds.add(msg.id);
+
   const isMine = msg.sender_session === user.sessionId;
   const div = document.createElement('div');
   div.className = 'msg ' + (isMine ? 'mine' : 'theirs');
@@ -94,38 +124,48 @@ function addMessageToUI(msg) {
   messagesEl.appendChild(div);
 }
 
-// ---------- Send message ----------
+// ---------- Send ----------
 async function sendMessage() {
   const text = msgInput.value.trim();
-  if (!text) {
-    msgInput.focus();
-    return;
-  }
+  if (!text) { msgInput.focus(); return; }
 
-  // Rate limit: 1 message per second
   const now = Date.now();
-  if (now - lastMessageTime < 1000) {
-    msgInput.focus();
-    return;
-  }
+  if (now - lastMessageTime < 1000) { msgInput.focus(); return; }
   lastMessageTime = now;
 
   msgInput.value = '';
 
-  await supabaseClient.from('messages').insert({
+  // Optimistic UI (show immediately)
+  const tempMsg = {
+    id: 'temp_' + Date.now(),
+    room_id: roomId,
+    sender_session: user.sessionId,
+    sender_name: user.name,
+    content: text,
+    created_at: new Date().toISOString()
+  };
+  addMessageToUI(tempMsg);
+  scrollToBottom();
+
+  const { error } = await supabaseClient.from('messages').insert({
     room_id: roomId,
     sender_session: user.sessionId,
     sender_name: user.name,
     content: text
   });
 
-  // ✅ Keep keyboard open on mobile
+  if (error) {
+    console.error('[chat] send failed', error);
+    showSystemMessage('Failed to send: ' + error.message);
+  } else {
+    console.log('[chat] message sent');
+  }
+
   msgInput.focus();
 }
 
-// ---------- Input events ----------
 sendBtn.addEventListener('click', (e) => {
-  e.preventDefault();      // stops button from stealing focus
+  e.preventDefault();
   sendMessage();
 });
 
@@ -138,13 +178,12 @@ msgInput.addEventListener('keydown', (e) => {
   }
 });
 
-// ---------- Typing indicator (Presence) ----------
-let presenceReady = false;
+// ---------- Presence ----------
 let partnerWasHere = false;
 let disconnectTimer = null;
 
 function setupPresence() {
-  presenceChannel = supabaseClient.channel('presence:' + roomId, {
+  presenceChannel = supabaseClient.channel('presence_' + roomId, {
     config: { presence: { key: user.sessionId } }
   });
 
@@ -152,39 +191,31 @@ function setupPresence() {
     .on('presence', { event: 'sync' }, () => {
       const state = presenceChannel.presenceState();
       const others = Object.keys(state).filter(k => k !== user.sessionId);
+      console.log('[chat] presence sync, others:', others.length);
 
       if (others.length > 0) {
-        // Partner is here
         partnerWasHere = true;
-        if (disconnectTimer) {
-          clearTimeout(disconnectTimer);
-          disconnectTimer = null;
-        }
+        if (disconnectTimer) { clearTimeout(disconnectTimer); disconnectTimer = null; }
       } else if (partnerWasHere) {
-        // Partner was here, now gone — wait 2s before showing message
         if (!disconnectTimer) {
           disconnectTimer = setTimeout(() => {
             showSystemMessage('Stranger disconnected.');
-          }, 2000);
+          }, 3000);
         }
       }
-      // If partner was never here yet, do nothing (avoid false alarm)
     })
     .on('presence', { event: 'leave' }, ({ key }) => {
-      if (key !== user.sessionId && partnerWasHere) {
-        if (!disconnectTimer) {
-          disconnectTimer = setTimeout(() => {
-            showSystemMessage('Stranger disconnected.');
-          }, 2000);
-        }
+      if (key !== user.sessionId && partnerWasHere && !disconnectTimer) {
+        disconnectTimer = setTimeout(() => {
+          showSystemMessage('Stranger disconnected.');
+        }, 3000);
       }
     })
     .on('broadcast', { event: 'typing' }, ({ payload }) => {
-      if (payload.session !== user.sessionId) {
-        showTyping();
-      }
+      if (payload.session !== user.sessionId) showTyping();
     })
     .subscribe(async (status) => {
+      console.log('[chat] presence status:', status);
       if (status === 'SUBSCRIBED') {
         await presenceChannel.track({ session: user.sessionId });
       }
@@ -201,6 +232,7 @@ function broadcastTyping() {
 }
 
 function showTyping() {
+  if (!typingIndicator) return;
   typingIndicator.classList.remove('hidden');
   clearTimeout(typingTimeout);
   typingTimeout = setTimeout(() => {
@@ -245,37 +277,31 @@ document.getElementById('blockBtn').addEventListener('click', async () => {
   window.location.href = 'match.html';
 });
 
-// ---------- End chat ----------
 async function endChat() {
   if (roomChannel) supabaseClient.removeChannel(roomChannel);
   if (presenceChannel) supabaseClient.removeChannel(presenceChannel);
-
-  await supabaseClient
-    .from('rooms')
-    .update({ status: 'ended' })
-    .eq('id', roomId);
-
-  await supabaseClient.from('messages').delete().eq('room_id', roomId);
+  await supabaseClient.from('rooms').update({ status: 'ended' }).eq('id', roomId);
 }
 
 // ---------- Helpers ----------
 function scrollToBottom() {
-  messagesEl.scrollTop = messagesEl.scrollHeight;
+  if (messagesEl) messagesEl.scrollTop = messagesEl.scrollHeight;
 }
 
 function escapeHtml(s) {
   return s.replace(/[&<>"']/g, m => ({
     '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'
-  }[ m ]));
+  }[m]));
 }
 
 function formatTime(ts) {
   const d = new Date(ts);
   return d.getHours().toString().padStart(2, '0') + ':' +
-    d.getMinutes().toString().padStart(2, '0');
+         d.getMinutes().toString().padStart(2, '0');
 }
 
 function showSystemMessage(text) {
+  if (!messagesEl) return;
   const div = document.createElement('div');
   div.className = 'msg system';
   div.textContent = text;
@@ -285,3 +311,10 @@ function showSystemMessage(text) {
 
 // ---------- Init ----------
 loadRoom();
+
+// Keep presence alive
+setInterval(() => {
+  if (presenceChannel) {
+    presenceChannel.track({ session: user.sessionId });
+  }
+}, 25000);
