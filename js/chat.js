@@ -68,15 +68,18 @@ async function loadMessages() {
 function subscribeMessages() {
   roomChannel = supabaseClient
     .channel('room:' + roomId)
-    .on(
-      'postgres_changes',
-      { event: 'INSERT', schema: 'public', table: 'messages', filter: `room_id=eq.${roomId}` },
+    .on('postgres_changes',
+      { event: 'INSERT', schema: 'public', table: 'messages' },
       (payload) => {
+        // Filter in JS instead of server-side
+        if (payload.new.room_id !== roomId) return;
         addMessageToUI(payload.new);
         scrollToBottom();
       }
     )
-    .subscribe();
+    .subscribe((status) => {
+      console.log('Realtime status:', status);
+    });
 }
 
 // ---------- Add message to UI ----------
