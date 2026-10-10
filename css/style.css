@@ -185,18 +185,26 @@ form input:focus, form select:focus { outline: none; border-color: #a855f7; }
   display: block !important;
   background: #0f0f0f;
   height: 100vh;
+  height: 100dvh;
   overflow: hidden;
+  position: fixed;
+  inset: 0;
+  width: 100%;
 }
 
 .chat-container {
   display: flex;
   flex-direction: column;
   height: 100vh;
+  height: 100dvh;
+  max-height: 100dvh;
+  width: 100%;
   max-width: 720px;
   margin: 0 auto;
   background: #141414;
   border-left: 1px solid #2a2a2a;
   border-right: 1px solid #2a2a2a;
+  overflow: hidden;
 }
 
 .chat-header {
