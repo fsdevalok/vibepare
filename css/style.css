@@ -239,10 +239,12 @@ form input:focus, form select:focus { outline: none; border-color: #a855f7; }
 .chat-messages {
   flex: 1;
   overflow-y: auto;
+  -webkit-overflow-scrolling: touch;
   padding: 16px;
   display: flex;
   flex-direction: column;
   gap: 10px;
+  min-height: 0;
 }
 
 .msg { display: flex; flex-direction: column; max-width: 75%; }
@@ -305,12 +307,16 @@ form input:focus, form select:focus { outline: none; border-color: #a855f7; }
 
 /* ⭐ THE CHAT INPUT BAR — THIS IS WHAT WAS MISSING ⭐ */
 .chat-input {
-  display: flex;
+  display: flex !important;
   gap: 8px;
   padding: 12px 16px;
+  padding-bottom: max(12px, env(safe-area-inset-bottom));
   border-top: 1px solid #2a2a2a;
   background: #1a1a1a;
   flex-shrink: 0;
+  position: relative;
+  z-index: 100;
+  width: 100%;
 }
 
 .chat-input input {
